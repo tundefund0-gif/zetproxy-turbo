@@ -41,7 +41,6 @@ func main() {
 	dashAddr := getEnv("ZETPROXY_DASHBOARD", ":9092")
 	overrideIP := os.Getenv("ZETPROXY_IP")
 	tunnelMode := os.Getenv("ZETPROXY_TUNNEL")
-	playitSecret := os.Getenv("PLAYIT_SECRET")
 	maxConns := int32(getEnvInt("ZETPROXY_MAX_CONNS", 4096))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -74,17 +73,12 @@ func main() {
 		socksPort = "1088"
 	}
 
-	if tunnelMode == "playit" {
+	if tunnelMode != "" {
+		_, relayAddr := tunnel.ParseTunnelConfig(tunnelMode)
 		go func() {
 			time.Sleep(2 * time.Second)
-			if playitSecret == "" {
-				log.Printf("[Tunnel] PLAYIT_SECRET not set!")
-				log.Printf("[Tunnel] 1. Sign up at https://playit.gg")
-				log.Printf("[Tunnel] 2. Create an agent → copy secret key")
-				log.Printf("[Tunnel] 3. Restart: PLAYIT_SECRET=<key> %s", os.Args[0])
-				return
-			}
-			if err := tunnel.StartPlayitTunnel(socksPort, playitSecret); err != nil {
+			log.Printf("[Tunnel] Starting relay to %s ...", relayAddr)
+			if err := tunnel.StartBoreTunnel(socksPort, relayAddr); err != nil {
 				log.Printf("[Tunnel] Error: %v", err)
 			}
 		}()
@@ -113,9 +107,9 @@ func main() {
 		log.Printf("    %-12s %s:%s (SOCKS5)", label, ip, socksAddr[1:])
 		log.Printf("    %-12s http://%s:%s (Dashboard)", label, ip, dashAddr[1:])
 	}
-	if tunnelMode == "playit" && playitSecret != "" {
+	if tunnelMode != "" {
 		log.Println("───────────────────────────────────────────")
-		log.Println("  Public Tunnel: playit.gg (connecting...)")
+		log.Println("  Public Tunnel: connecting to relay...")
 		log.Println("  Watch logs for the public SOCKS5 URL!")
 	}
 	log.Println("═══════════════════════════════════════════")
