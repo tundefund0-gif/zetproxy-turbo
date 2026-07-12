@@ -84,9 +84,9 @@ func main() {
 					log.Printf("[Tunnel] Error: %v", err)
 				}
 			case "serveo":
-				tunPort := socksAddr[1:]
+				tunPort := tcpAddr[1:]
 				if tunPort == "" {
-					tunPort = "1088"
+					tunPort = "8888"
 				}
 				log.Printf("[Tunnel] Starting serveo HTTP tunnel (port 80 -> TCP tunnel :%s) ...", tunPort)
 				if err := tunnel.StartSSHTunnel(tunPort, "serveo.net"); err != nil {
