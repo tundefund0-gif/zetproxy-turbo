@@ -74,11 +74,11 @@ func main() {
 	}
 
 	if tunnelMode != "" {
-		_, relayAddr := tunnel.ParseTunnelConfig(tunnelMode)
+		_, sshHost := tunnel.ParseTunnelConfig(tunnelMode)
 		go func() {
 			time.Sleep(2 * time.Second)
-			log.Printf("[Tunnel] Starting relay to %s ...", relayAddr)
-			if err := tunnel.StartBoreTunnel(socksPort, relayAddr); err != nil {
+			log.Printf("[Tunnel] Starting SSH tunnel to %s ...", sshHost)
+			if err := tunnel.StartSSHTunnel(socksPort, sshHost); err != nil {
 				log.Printf("[Tunnel] Error: %v", err)
 			}
 		}()
@@ -109,8 +109,8 @@ func main() {
 	}
 	if tunnelMode != "" {
 		log.Println("───────────────────────────────────────────")
-		log.Println("  Public Tunnel: connecting to relay...")
-		log.Println("  Watch logs for the public SOCKS5 URL!")
+		log.Println("  SSH Tunnel: connecting...")
+		log.Println("  Watch logs for the public URL!")
 	}
 	log.Println("═══════════════════════════════════════════")
 
