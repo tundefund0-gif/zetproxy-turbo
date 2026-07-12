@@ -202,8 +202,16 @@ func getPreferredIP() string {
 
 	ifaces, err := net.Interfaces()
 	if err == nil {
+		var fallbackIPs []string
 		for _, iface := range ifaces {
 			if iface.Flags&net.FlagUp == 0 {
+				continue
+			}
+			if iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			name := iface.Name
+			if isVirtualInterface(name) {
 				continue
 			}
 			addrs, err := iface.Addrs()
@@ -216,6 +224,9 @@ func getPreferredIP() string {
 					if ip4 == nil {
 						continue
 					}
+					if isTailscaleIP(ip4) {
+						continue
+					}
 					if ip4[0] == 192 && ip4[1] == 168 {
 						return ip4.String()
 					}
@@ -225,18 +236,53 @@ func getPreferredIP() string {
 					if ip4[0] == 10 {
 						return ip4.String()
 					}
+					fallbackIPs = append(fallbackIPs, ip4.String())
 				}
 			}
 		}
+		if len(fallbackIPs) > 0 {
+			return fallbackIPs[0]
+		}
 	}
 
-	conn, err := net.Dial("udp", "8.8.8.8:80")
+	conn, err := net.DialTimeout("udp", "8.8.8.8:53", 3*time.Second)
 	if err != nil {
-		return "127.0.0.1"
+		return "0.0.0.0"
 	}
 	defer conn.Close()
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
+	if localAddr.IP != nil && !isTailscaleIP(localAddr.IP.To4()) {
+		return localAddr.IP.String()
+	}
+	return "0.0.0.0"
+}
+
+var virtualIfaces = map[string]bool{
+	"tailscale": true, "docker": true, "tun": true, "tap": true,
+	"bridge": true, "lo": true, "virbr": true, "lxc": true,
+	"veth": true, "dummy": true, "sit": true, "ip6tnl": true,
+}
+
+func isVirtualInterface(name string) bool {
+	for i := 0; i < len(name); i++ {
+		if name[i] >= '0' && name[i] <= '9' {
+			prefix := name[:i]
+			if virtualIfaces[prefix] {
+				return true
+			}
+		}
+	}
+	return virtualIfaces[name]
+}
+
+func isTailscaleIP(ip net.IP) bool {
+	if ip == nil || len(ip) < 4 {
+		return false
+	}
+	if ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127 {
+		return true
+	}
+	return false
 }
 
 const indexHTML = `<!DOCTYPE html>
