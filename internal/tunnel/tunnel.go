@@ -2,7 +2,9 @@ package tunnel
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -12,25 +14,18 @@ import (
 	"github.com/user/zetproxy/internal/pool"
 )
 
-// Protocol represents the proxy protocol
-type Protocol int
-
-const (
-	ProtocolTCP  Protocol = iota
-	ProtocolUDP
-)
-
 // Stats tracks tunnel performance
+// NOTE: int64 fields first for ARM32 alignment (unaligned atomic panic fix)
 type Stats struct {
-	BytesIn      int64
-	BytesOut     int64
-	ConnsTotal   int64
-	StartTime    int64
-	ThroughputIn float64
-	ConnsActive  int32
+	BytesIn      int64   `json:"bytes_in"`
+	BytesOut     int64   `json:"bytes_out"`
+	ConnsTotal   int64   `json:"conns_total"`
+	StartTime    int64   `json:"start_time"`
+	ThroughputIn float64 `json:"throughput_in_mbps"`
+	ConnsActive  int32   `json:"conns_active"`
 }
 
-// Server is the ultra-fast tunnel
+// Server is the ultra-fast tunnel with auto-detection
 type Server struct {
 	tcpAddr  string
 	udpAddr  string
@@ -112,7 +107,6 @@ func (s *Server) startTCP(ctx context.Context) error {
 		atomic.AddInt32(&s.stats.ConnsActive, 1)
 		atomic.AddInt64(&s.stats.ConnsTotal, 1)
 
-		// Apply TCP optimizations
 		if tcp, ok := conn.(*net.TCPConn); ok {
 			tcp.SetNoDelay(true)
 			tcp.SetKeepAlive(true)
@@ -128,7 +122,7 @@ func (s *Server) startTCP(ctx context.Context) error {
 func (s *Server) handleTCP(client net.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[TCP] Recovered: %v", r)
+			log.Printf("[TCP] Panic: %v", r)
 		}
 	}()
 	defer client.Close()
@@ -136,51 +130,159 @@ func (s *Server) handleTCP(client net.Conn) {
 
 	client.SetDeadline(time.Now().Add(60 * time.Second))
 
-	// Read protocol header to determine destination
-	buf := make([]byte, 1024)
+	// Read protocol header
+	buf := make([]byte, 4096)
 	n, err := client.Read(buf)
 	if err != nil {
 		return
 	}
 
-	// Parse target from HTTP CONNECT or SOCKS5
-	host, proxyType := parseTarget(buf[:n])
-	if host == "" {
+	peek := buf[:n]
+
+	// Auto-detect protocol
+	// SOCKS5
+	if len(peek) > 0 && peek[0] == 5 {
+		host, err := s.handleSOCKS5(client, peek)
+		if err != nil {
+			return
+		}
+		if host == "" {
+			return
+		}
+
+		target, err := net.DialTimeout("tcp", host, 10*time.Second)
+		if err != nil {
+			return
+		}
+		defer target.Close()
+		s.applyTCPOpts(target)
+
+		client.SetDeadline(time.Time{})
+		n1, n2 := s.pool.Relay(client, target)
+		atomic.AddInt64(&s.stats.BytesIn, n1)
+		atomic.AddInt64(&s.stats.BytesOut, n2)
 		return
 	}
 
-	// Connect with optimizations
-	target, err := net.DialTimeout("tcp", host, 5*time.Second)
+	// HTTP CONNECT
+	if len(peek) >= 7 && string(peek[:7]) == "CONNECT" {
+		// Extract host
+		host := extractCONNECTHost(peek)
+		if host == "" {
+			return
+		}
+
+		target, err := net.DialTimeout("tcp", host, 10*time.Second)
+		if err != nil {
+			return
+		}
+		defer target.Close()
+		s.applyTCPOpts(target)
+
+		client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		client.SetDeadline(time.Time{})
+
+		n1, n2 := s.pool.Relay(client, target)
+		atomic.AddInt64(&s.stats.BytesIn, n1)
+		atomic.AddInt64(&s.stats.BytesOut, n2)
+		return
+	}
+
+	// Regular HTTP proxy - extract Host header
+	host := extractHTTPHost(peek)
+	if host != "" {
+		target, err := net.DialTimeout("tcp", host, 10*time.Second)
+		if err != nil {
+			return
+		}
+		defer target.Close()
+		s.applyTCPOpts(target)
+
+		target.Write(peek)
+		client.SetDeadline(time.Time{})
+
+		n1, n2 := s.pool.Relay(client, target)
+		atomic.AddInt64(&s.stats.BytesIn, n1)
+		atomic.AddInt64(&s.stats.BytesOut, n2)
+		return
+	}
+}
+
+func (s *Server) handleSOCKS5(client net.Conn, initial []byte) (string, error) {
+	// Parse SOCKS5 hello
+	if len(initial) < 3 {
+		return "", fmt.Errorf("short SOCKS5")
+	}
+	nmethods := int(initial[1])
+	expected := 2 + nmethods
+	if len(initial) < expected {
+		return "", fmt.Errorf("incomplete hello")
+	}
+
+	// No auth
+	client.Write([]byte{0x05, 0x00})
+
+	// Read connect request
+	reqBuf := make([]byte, 4)
+	_, err := io.ReadFull(client, reqBuf)
 	if err != nil {
-		return
+		return "", err
 	}
-	defer target.Close()
 
-	if tcp, ok := target.(*net.TCPConn); ok {
+	ver := reqBuf[0]
+	cmd := reqBuf[1]
+	atyp := reqBuf[3]
+
+	if ver != 5 || cmd != 1 {
+		client.Write([]byte{0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		return "", fmt.Errorf("unsupported cmd")
+	}
+
+	var host string
+	var port uint16
+
+	switch atyp {
+	case 1: // IPv4
+		b := make([]byte, 4)
+		io.ReadFull(client, b)
+		host = net.IP(b).String()
+	case 3: // Domain
+		b := make([]byte, 1)
+		io.ReadFull(client, b)
+		l := int(b[0])
+		b2 := make([]byte, l)
+		io.ReadFull(client, b2)
+		host = string(b2)
+	case 4: // IPv6
+		b := make([]byte, 16)
+		io.ReadFull(client, b)
+		host = net.IP(b).String()
+	default:
+		return "", fmt.Errorf("unknown atyp")
+	}
+
+	pb := make([]byte, 2)
+	io.ReadFull(client, pb)
+	port = binary.BigEndian.Uint16(pb)
+
+	targetAddr := fmt.Sprintf("%s:%d", host, port)
+
+	// Send success
+	localIP := net.ParseIP("0.0.0.0").To4()
+	resp := []byte{0x05, 0x00, 0x00, 0x01, localIP[0], localIP[1], localIP[2], localIP[3], byte(port >> 8), byte(port & 0xff)}
+	client.Write(resp)
+
+	return targetAddr, nil
+}
+
+func (s *Server) applyTCPOpts(conn net.Conn) {
+	if tcp, ok := conn.(*net.TCPConn); ok {
 		tcp.SetNoDelay(true)
 		tcp.SetKeepAlive(true)
 		tcp.SetKeepAlivePeriod(15 * time.Second)
 		tcp.SetReadBuffer(512 * 1024)
 		tcp.SetWriteBuffer(512 * 1024)
 	}
-
-	client.SetDeadline(time.Time{})
-
-	// For HTTP CONNECT, send 200
-	if proxyType == "CONNECT" {
-		client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	}
-
-	// For HTTP, forward the initial data
-	if proxyType == "HTTP" {
-		target.Write(buf[:n])
-	}
-
-	// Bidirectional zero-copy relay
-	atomic.AddInt64(&s.stats.BytesIn, 0) // placeholder for real counting
-	n1, n2 := s.pool.Relay(client, target)
-	atomic.AddInt64(&s.stats.BytesIn, n1)
-	atomic.AddInt64(&s.stats.BytesOut, n2)
 }
 
 func (s *Server) startUDP(ctx context.Context) error {
@@ -231,7 +333,6 @@ func (s *Server) startUDP(ctx context.Context) error {
 			continue
 		}
 
-		// Resolve destination
 		targetAddr, _ := net.ResolveUDPAddr("udp", "1.1.1.1:53")
 		conn, err := net.DialUDP("udp", nil, targetAddr)
 		if err != nil {
@@ -268,43 +369,30 @@ func (s *Server) startUDP(ctx context.Context) error {
 	}
 }
 
-func parseTarget(data []byte) (string, string) {
-	if len(data) < 4 {
-		return "", ""
-	}
-
-	// HTTP CONNECT
-	if len(data) >= 7 && string(data[:7]) == "CONNECT" {
-		end := len(data)
-		for i := 7; i < len(data); i++ {
-			if data[i] == ' ' || data[i] == '\r' || data[i] == '\n' {
-				end = i
-				break
-			}
-		}
-		return string(data[8:end]), "CONNECT"
-	}
-
-	// SOCKS5
-	if data[0] == 5 {
-		return "", "" // Would need full handshake
-	}
-
-	// Regular HTTP - extract Host header
-	if len(data) >= 4 && string(data[:4]) == "GET " || string(data[:4]) == "POST" {
-		lines := string(data)
-		for _, line := range splitLines(lines) {
-			if len(line) > 6 && toLower(line[:6]) == "host: " {
-				host := line[6:]
-				if idx := indexOf(host, "\r"); idx != -1 {
-					host = host[:idx]
-				}
-				return host, "HTTP"
-			}
+func extractCONNECTHost(data []byte) string {
+	// Format: CONNECT host:port HTTP/1.1
+	s := string(data)
+	for i := 7; i < len(s); i++ {
+		if s[i] == ' ' {
+			return s[8:i]
 		}
 	}
+	return ""
+}
 
-	return "", ""
+func extractHTTPHost(data []byte) string {
+	s := string(data)
+	lines := splitLines(s)
+	for _, line := range lines {
+		if len(line) > 6 && toLower(line[:6]) == "host: " {
+			host := line[6:]
+			if idx := indexOf(host, "\r"); idx != -1 {
+				host = host[:idx]
+			}
+			return host
+		}
+	}
+	return ""
 }
 
 func splitLines(s string) []string {
