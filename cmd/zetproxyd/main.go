@@ -40,6 +40,8 @@ func main() {
 	socksAddr := getEnv("ZETPROXY_SOCKS5", ":1088")
 	dashAddr := getEnv("ZETPROXY_DASHBOARD", ":9092")
 	overrideIP := os.Getenv("ZETPROXY_IP")
+	tunnelMode := os.Getenv("ZETPROXY_TUNNEL")
+	playitSecret := os.Getenv("PLAYIT_SECRET")
 	maxConns := int32(getEnvInt("ZETPROXY_MAX_CONNS", 4096))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -67,10 +69,32 @@ func main() {
 		}
 	}()
 
+	socksPort := socksAddr[1:]
+	if socksPort == "" {
+		socksPort = "1088"
+	}
+
+	if tunnelMode == "playit" {
+		go func() {
+			time.Sleep(2 * time.Second)
+			if playitSecret == "" {
+				log.Printf("[Tunnel] PLAYIT_SECRET not set!")
+				log.Printf("[Tunnel] 1. Sign up at https://playit.gg")
+				log.Printf("[Tunnel] 2. Create an agent → copy secret key")
+				log.Printf("[Tunnel] 3. Restart: PLAYIT_SECRET=<key> %s", os.Args[0])
+				return
+			}
+			if err := tunnel.StartPlayitTunnel(socksPort, playitSecret); err != nil {
+				log.Printf("[Tunnel] Error: %v", err)
+			}
+		}()
+	}
+
 	localIP := overrideIP
 	if localIP == "" {
 		localIP = getPreferredIP()
 	}
+	allIPs := getAllIPs()
 	log.Printf("Advertised IP: %s (override=%q)", localIP, overrideIP)
 
 	log.Println("═══════════════════════════════════════════")
@@ -79,6 +103,21 @@ func main() {
 	log.Printf("  UDP Tunnel: %s:%s", localIP, udpAddr[1:])
 	log.Printf("  Dashboard:  http://%s:%s", localIP, dashAddr[1:])
 	log.Printf("  Max Conns:  %d", maxConns)
+	log.Println("───────────────────────────────────────────")
+	log.Printf("  Reachable via:")
+	for _, ip := range allIPs {
+		label := "LAN"
+		if isTailscaleIP(net.ParseIP(ip).To4()) {
+			label = "TAILSCALE"
+		}
+		log.Printf("    %-12s %s:%s (SOCKS5)", label, ip, socksAddr[1:])
+		log.Printf("    %-12s http://%s:%s (Dashboard)", label, ip, dashAddr[1:])
+	}
+	if tunnelMode == "playit" && playitSecret != "" {
+		log.Println("───────────────────────────────────────────")
+		log.Println("  Public Tunnel: playit.gg (connecting...)")
+		log.Println("  Watch logs for the public SOCKS5 URL!")
+	}
 	log.Println("═══════════════════════════════════════════")
 
 	go func() {
@@ -106,6 +145,7 @@ func main() {
 	go func() {
 		tun.Stop()
 		socks.Stop()
+		tunnel.StopTunnel()
 		close(done)
 	}()
 
@@ -137,51 +177,22 @@ func getEnvInt(key string, def int) int {
 }
 
 func getPreferredIP() string {
-	ifaces, err := net.Interfaces()
-	if err == nil {
-		var fallbackIPs []string
-		for _, iface := range ifaces {
-			if iface.Flags&net.FlagUp == 0 {
-				continue
-			}
-			if iface.Flags&net.FlagLoopback != 0 {
-				continue
-			}
-			name := iface.Name
-			if isVirtualInterface(name) {
-				continue
-			}
-			addrs, err := iface.Addrs()
-			if err != nil {
-				continue
-			}
-			for _, addr := range addrs {
-				if ipnet, ok := addr.(*net.IPNet); ok {
-					ip4 := ipnet.IP.To4()
-					if ip4 == nil {
-						continue
-					}
-					if isTailscaleIP(ip4) {
-						continue
-					}
-					if ip4[0] == 192 && ip4[1] == 168 {
-						return ip4.String()
-					}
-					if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
-						return ip4.String()
-					}
-					if ip4[0] == 10 {
-						return ip4.String()
-					}
-					fallbackIPs = append(fallbackIPs, ip4.String())
-				}
-			}
+	ips := getAllIPs()
+	for _, ip := range ips {
+		parsed := net.ParseIP(ip).To4()
+		if parsed == nil {
+			continue
 		}
-		if len(fallbackIPs) > 0 {
-			return fallbackIPs[0]
+		if isTailscaleIP(parsed) {
+			continue
+		}
+		if isPrivateIP(parsed) {
+			return ip
 		}
 	}
-
+	if len(ips) > 0 {
+		return ips[0]
+	}
 	conn, err := net.DialTimeout("udp", "8.8.8.8:53", 3*time.Second)
 	if err != nil {
 		return "0.0.0.0"
@@ -194,30 +205,57 @@ func getPreferredIP() string {
 	return "0.0.0.0"
 }
 
-var virtualIfaces = map[string]bool{
-	"tailscale": true, "docker": true, "tun": true, "tap": true,
-	"bridge": true, "lo": true, "virbr": true, "lxc": true,
-	"veth": true, "dummy": true, "sit": true, "ip6tnl": true,
-}
-
-func isVirtualInterface(name string) bool {
-	for i := 0; i < len(name); i++ {
-		if name[i] >= '0' && name[i] <= '9' {
-			prefix := name[:i]
-			if virtualIfaces[prefix] {
-				return true
+func getAllIPs() []string {
+	var ips []string
+	seen := map[string]bool{}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ips
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				ip4 := ipnet.IP.To4()
+				if ip4 == nil || seen[ip4.String()] {
+					continue
+				}
+				seen[ip4.String()] = true
+				ips = append(ips, ip4.String())
 			}
 		}
 	}
-	return virtualIfaces[name]
+	return ips
 }
 
-func isTailscaleIP(ip net.IP) bool {
+func isPrivateIP(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
-	if ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127 {
+	if ip[0] == 192 && ip[1] == 168 {
+		return true
+	}
+	if ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31 {
+		return true
+	}
+	if ip[0] == 10 {
 		return true
 	}
 	return false
+}
+
+func isTailscaleIP(ip net.IP) bool {
+	if ip == nil || len(ip) < 4 {
+		return false
+	}
+	return ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127
 }

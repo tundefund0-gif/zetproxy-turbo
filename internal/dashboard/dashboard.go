@@ -134,6 +134,8 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"udp_packets":      tunStats.UDPPackets,
 		"uptime_sec":       uptime,
 		"local_ip":         getPreferredIP(),
+		"all_ips":          getAllIPs(),
+		"tunnel_url":       tunnel.GetTunnelURL(),
 		"mem_alloc_mb":     m.Alloc / 1024 / 1024,
 		"mem_sys_mb":       m.Sys / 1024 / 1024,
 		"num_goroutine":    runtime.NumGoroutine(),
@@ -199,52 +201,22 @@ func getPreferredIP() string {
 	if ip := os.Getenv("ZETPROXY_IP"); ip != "" {
 		return ip
 	}
-
-	ifaces, err := net.Interfaces()
-	if err == nil {
-		var fallbackIPs []string
-		for _, iface := range ifaces {
-			if iface.Flags&net.FlagUp == 0 {
-				continue
-			}
-			if iface.Flags&net.FlagLoopback != 0 {
-				continue
-			}
-			name := iface.Name
-			if isVirtualInterface(name) {
-				continue
-			}
-			addrs, err := iface.Addrs()
-			if err != nil {
-				continue
-			}
-			for _, addr := range addrs {
-				if ipnet, ok := addr.(*net.IPNet); ok {
-					ip4 := ipnet.IP.To4()
-					if ip4 == nil {
-						continue
-					}
-					if isTailscaleIP(ip4) {
-						continue
-					}
-					if ip4[0] == 192 && ip4[1] == 168 {
-						return ip4.String()
-					}
-					if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
-						return ip4.String()
-					}
-					if ip4[0] == 10 {
-						return ip4.String()
-					}
-					fallbackIPs = append(fallbackIPs, ip4.String())
-				}
-			}
+	ips := getAllIPs()
+	for _, ip := range ips {
+		parsed := net.ParseIP(ip).To4()
+		if parsed == nil {
+			continue
 		}
-		if len(fallbackIPs) > 0 {
-			return fallbackIPs[0]
+		if isTailscaleIP(parsed) {
+			continue
+		}
+		if isPrivateIP(parsed) {
+			return ip
 		}
 	}
-
+	if len(ips) > 0 {
+		return ips[0]
+	}
 	conn, err := net.DialTimeout("udp", "8.8.8.8:53", 3*time.Second)
 	if err != nil {
 		return "0.0.0.0"
@@ -257,33 +229,63 @@ func getPreferredIP() string {
 	return "0.0.0.0"
 }
 
-var virtualIfaces = map[string]bool{
-	"tailscale": true, "docker": true, "tun": true, "tap": true,
-	"bridge": true, "lo": true, "virbr": true, "lxc": true,
-	"veth": true, "dummy": true, "sit": true, "ip6tnl": true,
-}
-
-func isVirtualInterface(name string) bool {
-	for i := 0; i < len(name); i++ {
-		if name[i] >= '0' && name[i] <= '9' {
-			prefix := name[:i]
-			if virtualIfaces[prefix] {
-				return true
+func getAllIPs() []string {
+	var ips []string
+	seen := map[string]bool{}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ips
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				ip4 := ipnet.IP.To4()
+				if ip4 == nil || seen[ip4.String()] {
+					continue
+				}
+				seen[ip4.String()] = true
+				ips = append(ips, ip4.String())
 			}
 		}
 	}
-	return virtualIfaces[name]
+	return ips
+}
+
+func isPrivateIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip[0] == 192 && ip[1] == 168 {
+		return true
+	}
+	if ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31 {
+		return true
+	}
+	if ip[0] == 10 {
+		return true
+	}
+	return false
 }
 
 func isTailscaleIP(ip net.IP) bool {
 	if ip == nil || len(ip) < 4 {
 		return false
 	}
-	if ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127 {
-		return true
-	}
-	return false
+	return ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127
 }
+
+// Deprecated — kept for reference
+var _ = isPrivateIP
 
 const indexHTML = `<!DOCTYPE html>
 <html lang="en">
@@ -415,7 +417,7 @@ function formatBytes(b){if(b<1024)return b.toFixed(0)+' B';if(b<1048576)return(b
 function formatSpeed(mbps){if(mbps<1)return(mbps*1000).toFixed(0)+' Kbps';return mbps.toFixed(1)+' Mbps'}
 function formatTime(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=Math.floor(s%60);return(h>0?h+'h ':'')+(m>0?m+'m ':'')+sec+'s'}
 function drawChart(){const c=document.getElementById('chart'),ctx=c.getContext('2d');const dpr=window.devicePixelRatio||1;const rect=c.getBoundingClientRect();c.width=rect.width*dpr;c.height=120*dpr;ctx.scale(dpr,dpr);const w=rect.width,h=120;ctx.clearRect(0,0,w,h);if(chartData.length<2)return;const maxVal=Math.max(...chartData.map(d=>d.throughput),1);const step=w/(maxChartPoints-1);ctx.beginPath();ctx.strokeStyle='#00f0ff';ctx.lineWidth=2;ctx.lineJoin='round';chartData.forEach((d,i)=>{const x=i*step;const y=h-((d.throughput/maxVal)*(h-20))-10;if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y)});ctx.stroke();const grad=ctx.createLinearGradient(0,0,0,h);grad.addColorStop(0,'rgba(0,240,255,0.15)');grad.addColorStop(1,'rgba(0,240,255,0)');ctx.lineTo(w,h);ctx.lineTo(0,h);ctx.closePath();ctx.fillStyle=grad;ctx.fill();ctx.fillStyle='#64748b';ctx.font='10px monospace';ctx.fillText(formatSpeed(maxVal)+' max',4,12);ctx.fillText('0',4,h-4)}
-async function fetchStats(){try{const r=await fetch('/api/stats');const d=await r.json();const ip=d.local_ip||'127.0.0.1';document.getElementById('server-bar').innerHTML='<div class="server-chip">SOCKS5: <code>'+ip+':1088</code></div><div class="server-chip">TCP: <code>'+ip+':8888</code></div><div class="server-chip">UDP: <code>'+ip+':8889</code></div><div class="server-chip">Dashboard: <code>'+ip+':9092</code></div>';document.getElementById('thr-in').innerHTML=formatSpeed(d.throughput_in).replace(/ /,'<span class="unit">')+'</span>';document.getElementById('thr-in-sub').textContent=formatBytes(d.bytes_in)+'/s';document.getElementById('thr-out').innerHTML=formatSpeed(d.throughput_out).replace(/ /,'<span class="unit">')+'</span>';document.getElementById('thr-out-sub').textContent=formatBytes(d.bytes_out)+'/s';document.getElementById('conns').textContent=d.conns_active;document.getElementById('conns-sub').textContent=d.conns_total+' total';document.getElementById('socks-active').textContent=d.socks_conns;document.getElementById('socks-sub').textContent=d.socks_failed+' failed';const totalBytes=d.bytes_in+d.bytes_out;document.getElementById('total').innerHTML=formatBytes(totalBytes).replace(/ /,'<span class="unit">')+'</span>';document.getElementById('data-io').innerHTML=formatBytes(d.bytes_in)+' / '+formatBytes(d.bytes_out)+'<span class="unit"></span>';document.getElementById('uptime').textContent=formatTime(d.uptime_sec);document.getElementById('memory').innerHTML=d.mem_alloc_mb+'<span class="unit">MB</span>';document.getElementById('memory-sub').textContent=d.num_goroutine+' goroutines';document.getElementById('socks-badge').textContent='SOCKS5 '+(d.socks_conns>0?'LINKED':'IDLE');document.getElementById('sys-info').innerHTML='<div>CPU Cores: '+d.num_cpu+'</div><div>Memory Sys: '+d.mem_sys_mb+' MB</div><div>TCP Accepts: '+d.tcp_accepts+'</div><div>UDP Packets: '+d.udp_packets+'</div><div>Rejected: '+d.conns_rejected+'</div><div>Started: '+new Date(d.start_time*1000).toLocaleString()+'</div>';chartData.push({throughput:d.throughput_in+d.throughput_out});if(chartData.length>maxChartPoints)chartData.shift();drawChart()}catch(e){}}
+async function fetchStats(){try{const r=await fetch('/api/stats');const d=await r.json();const ip=d.local_ip||'127.0.0.1';const allIps=d.all_ips||[ip];const tun=d.tunnel_url||'';let bar='';allIps.forEach(function(addr){const label=addr.startsWith('100.')?'TAILSCALE':'LAN';bar+='<div class="server-chip">'+label+' SOCKS5: <code>'+addr+':1088</code></div><div class="server-chip">'+label+' Dash: <code>http://'+addr+':9092</code></div>'});if(tun){bar+='<div class="server-chip" style="border-color:var(--accent)">PUBLIC SOCKS5: <code>'+tun+'</code></div>'};document.getElementById('server-bar').innerHTML=bar;document.getElementById('thr-in').innerHTML=formatSpeed(d.throughput_in).replace(/ /,'<span class="unit">')+'</span>';document.getElementById('thr-in-sub').textContent=formatBytes(d.bytes_in)+'/s';document.getElementById('thr-out').innerHTML=formatSpeed(d.throughput_out).replace(/ /,'<span class="unit">')+'</span>';document.getElementById('thr-out-sub').textContent=formatBytes(d.bytes_out)+'/s';document.getElementById('conns').textContent=d.conns_active;document.getElementById('conns-sub').textContent=d.conns_total+' total';document.getElementById('socks-active').textContent=d.socks_conns;document.getElementById('socks-sub').textContent=d.socks_failed+' failed';const totalBytes=d.bytes_in+d.bytes_out;document.getElementById('total').innerHTML=formatBytes(totalBytes).replace(/ /,'<span class="unit">')+'</span>';document.getElementById('data-io').innerHTML=formatBytes(d.bytes_in)+' / '+formatBytes(d.bytes_out)+'<span class="unit"></span>';document.getElementById('uptime').textContent=formatTime(d.uptime_sec);document.getElementById('memory').innerHTML=d.mem_alloc_mb+'<span class="unit">MB</span>';document.getElementById('memory-sub').textContent=d.num_goroutine+' goroutines';document.getElementById('socks-badge').textContent='SOCKS5 '+(d.socks_conns>0?'LINKED':'IDLE');document.getElementById('sys-info').innerHTML='<div>CPU Cores: '+d.num_cpu+'</div><div>Memory Sys: '+d.mem_sys_mb+' MB</div><div>TCP Accepts: '+d.tcp_accepts+'</div><div>UDP Packets: '+d.udp_packets+'</div><div>Rejected: '+d.conns_rejected+'</div><div>Started: '+new Date(d.start_time*1000).toLocaleString()+'</div>';chartData.push({throughput:d.throughput_in+d.throughput_out});if(chartData.length>maxChartPoints)chartData.shift();drawChart()}catch(e){}}
 async function fetchConnections(){try{const r=await fetch('/api/connections');const logs=await r.json();const el=document.getElementById('conn-log');if(!logs||logs.length===0){el.innerHTML='<div style="color:var(--muted);padding:20px;text-align:center">No connections yet</div>';return}const recent=logs.slice(-20).reverse();el.innerHTML=recent.map(l=>'<div class="log-entry"><span class="log-time">'+new Date(l.timestamp).toLocaleTimeString()+'</span><span class="log-addr">'+l.addr+'</span><span class="log-target">'+l.target+'</span><span class="log-status '+(l.status==='connected'?'ok':'fail')+'">'+l.status+'</span></div>').join('')}catch(e){}}
 setInterval(fetchStats,1000);setInterval(fetchConnections,3000);fetchStats();fetchConnections();
 window.addEventListener('resize',drawChart);
