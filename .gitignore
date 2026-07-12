@@ -1,3 +1,7 @@
-zetproxyd
-zetproxyd_*
+/zetproxyd
+/zetproxyd_*
+/zetproxyd-*
+/relay
+/relay_*
 *.log
+*.out

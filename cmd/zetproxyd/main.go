@@ -22,7 +22,7 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.SetPrefix("[ZetProxy] ")
 
-	fmt.Println(`
+	fmt.Printf(`
   ███████╗███████╗████████╗██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗
   ╚══███╔╝██╔════╝╚══██╔══╝██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝
     ███╔╝ █████╗     ██║   ██████╔╝██████╔╝██║   ██║ ╚███╔╝  ╚████╔╝
@@ -30,7 +30,7 @@ func main() {
   ███████╗███████╗   ██║   ██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║
   ╚══════╝╚══════╝   ╚═╝   ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝
   Ultra-Fast Proxy Tunnel — Turbo Edition v%s
-	`, Version)
+`, Version)
 
 	log.Printf("Starting ZetProxy Turbo v%s", Version)
 	log.Printf("Go %s | %d CPUs | GOMAXPROCS=%d", runtime.Version(), runtime.NumCPU(), runtime.GOMAXPROCS(0))
@@ -74,12 +74,29 @@ func main() {
 	}
 
 	if tunnelMode != "" {
-		_, sshHost := tunnel.ParseTunnelConfig(tunnelMode)
+		mode, remote := tunnel.ParseTunnelConfig(tunnelMode)
 		go func() {
 			time.Sleep(2 * time.Second)
-			log.Printf("[Tunnel] Starting SSH tunnel to %s ...", sshHost)
-			if err := tunnel.StartSSHTunnel(socksPort, sshHost); err != nil {
-				log.Printf("[Tunnel] Error: %v", err)
+			switch mode {
+			case "relay":
+				log.Printf("[Tunnel] Starting relay tunnel to %s ...", remote)
+				if err := tunnel.StartRelayTunnel(socksPort, remote); err != nil {
+					log.Printf("[Tunnel] Error: %v", err)
+				}
+			case "serveo":
+				tunPort := socksAddr[1:]
+				if tunPort == "" {
+					tunPort = "1088"
+				}
+				log.Printf("[Tunnel] Starting serveo HTTP tunnel (port 80 -> TCP tunnel :%s) ...", tunPort)
+				if err := tunnel.StartSSHTunnel(tunPort, "serveo.net"); err != nil {
+					log.Printf("[Tunnel] Error: %v", err)
+				}
+			default:
+				log.Printf("[Tunnel] Starting SSH tunnel to %s ...", remote)
+				if err := tunnel.StartSSHTunnel(socksPort, remote); err != nil {
+					log.Printf("[Tunnel] Error: %v", err)
+				}
 			}
 		}()
 	}
@@ -108,8 +125,9 @@ func main() {
 		log.Printf("    %-12s http://%s:%s (Dashboard)", label, ip, dashAddr[1:])
 	}
 	if tunnelMode != "" {
+		mode, remote := tunnel.ParseTunnelConfig(tunnelMode)
 		log.Println("───────────────────────────────────────────")
-		log.Println("  SSH Tunnel: connecting...")
+		log.Printf("  Tunnel: %s -> %s (connecting...)", mode, remote)
 		log.Println("  Watch logs for the public URL!")
 	}
 	log.Println("═══════════════════════════════════════════")
