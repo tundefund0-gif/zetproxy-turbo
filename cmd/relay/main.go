@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -15,13 +16,15 @@ import (
 )
 
 var (
-	ctrlMu sync.Mutex
-	ctrl   = make(map[string]net.Conn)
+	ctrlMu    sync.Mutex
+	ctrl      = make(map[string]net.Conn)
+	lastPhone string
 
 	waitMu sync.Mutex
 	wait   = make(map[string]waitEntry)
 
-	nextID int
+	nextID   int
+	connCID  int
 )
 
 type waitEntry struct {
@@ -66,8 +69,18 @@ func safeHandle(conn net.Conn) {
 }
 
 func handle(conn net.Conn) {
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
+
 	r := bufio.NewReaderSize(conn, 65536)
+	b, err := r.Peek(1)
+	if err != nil {
+		return
+	}
+
+	if b[0] == 0x05 {
+		handleSOCKS5(conn, r)
+		return
+	}
 
 	line, err := r.ReadString('\n')
 	if err != nil {
@@ -83,10 +96,10 @@ func handle(conn net.Conn) {
 		nextID++
 		id := fmt.Sprintf("p%d", nextID)
 		ctrl[id] = conn
+		lastPhone = id
 		ctrlMu.Unlock()
 		fmt.Fprintf(conn, "id:%s\n", id)
 		log.Printf("[%s] Register", id)
-
 		b := make([]byte, 1)
 		for {
 			_, err := conn.Read(b)
@@ -96,6 +109,9 @@ func handle(conn net.Conn) {
 		}
 		ctrlMu.Lock()
 		delete(ctrl, id)
+		if lastPhone == id {
+			lastPhone = ""
+		}
 		ctrlMu.Unlock()
 
 	case strings.HasPrefix(line, "connect:"):
@@ -120,12 +136,7 @@ func handle(conn net.Conn) {
 
 		select {
 		case data := <-ch:
-			if t, ok := conn.(*net.TCPConn); ok {
-				t.SetNoDelay(true)
-			}
-			if t, ok := data.(*net.TCPConn); ok {
-				t.SetNoDelay(true)
-			}
+			setNoDelay(conn, data)
 			pipe(conn, r, data, bufio.NewReaderSize(data, 65536))
 		case <-time.After(60 * time.Second):
 		}
@@ -141,7 +152,6 @@ func handle(conn net.Conn) {
 			delete(wait, id)
 		}
 		waitMu.Unlock()
-
 		if ok {
 			entry.dataCh <- conn
 		}
@@ -151,6 +161,156 @@ func handle(conn net.Conn) {
 
 	default:
 		fmt.Fprintf(conn, "relay\n")
+	}
+}
+
+func handleSOCKS5(conn net.Conn, r *bufio.Reader) {
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
+
+	// Read handshake: version(1) nmethods(1) methods(nmethods)
+	hdr := make([]byte, 2)
+	_, err := io.ReadFull(r, hdr)
+	if err != nil {
+		return
+	}
+	nmethods := int(hdr[1])
+	if nmethods > 255 {
+		return
+	}
+	_, err = io.ReadFull(r, make([]byte, nmethods))
+	if err != nil {
+		return
+	}
+	// Reply: no auth
+	conn.Write([]byte{0x05, 0x00})
+
+	// Read request: ver(1) cmd(1) rsv(1) atyp(1) dst.addr(varies) dst.port(2)
+	reqHdr := make([]byte, 4)
+	_, err = io.ReadFull(r, reqHdr)
+	if err != nil {
+		return
+	}
+	cmd := reqHdr[1]
+	atyp := reqHdr[3]
+
+	if cmd != 0x01 { // only CONNECT
+		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) // cmd not supported
+		return
+	}
+
+	target, err := readAddr(r, atyp)
+	if err != nil {
+		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	port, err := readPort(r)
+	if err != nil {
+		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	targetAddr := net.JoinHostPort(target, fmt.Sprintf("%d", port))
+	conn.SetDeadline(time.Time{})
+
+	ctrlMu.Lock()
+	phoneID := lastPhone
+	ctrlMu.Unlock()
+	if phoneID == "" {
+		log.Printf("[SOCKS5] No phone registered")
+		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
+	waitMu.Lock()
+	connCID++
+	cid := fmt.Sprintf("c%d", connCID)
+	ch := make(chan net.Conn, 1)
+	wait[cid] = waitEntry{client: conn, dataCh: ch}
+	waitMu.Unlock()
+
+	ctrlMsg := fmt.Sprintf("conn:%s:%s\n", cid, targetAddr)
+
+	ctrlMu.Lock()
+	sc, ok := ctrl[phoneID]
+	ctrlMu.Unlock()
+	if !ok {
+		waitMu.Lock()
+		delete(wait, cid)
+		waitMu.Unlock()
+		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
+	_, err = sc.Write([]byte(ctrlMsg))
+	if err != nil {
+		waitMu.Lock()
+		delete(wait, cid)
+		waitMu.Unlock()
+		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
+	log.Printf("[SOCKS5] %s -> %s via %s", conn.RemoteAddr(), targetAddr, phoneID)
+
+	select {
+	case data := <-ch:
+		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		setNoDelay(conn, data)
+		pipe(conn, r, data, bufio.NewReaderSize(data, 65536))
+		log.Printf("[SOCKS5] %s closed", targetAddr)
+	case <-time.After(60 * time.Second):
+		log.Printf("[SOCKS5] %s timeout", targetAddr)
+		waitMu.Lock()
+		delete(wait, cid)
+		waitMu.Unlock()
+		conn.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	}
+}
+
+func readAddr(r *bufio.Reader, atyp byte) (string, error) {
+	switch atyp {
+	case 0x01: // IPv4
+		b := make([]byte, 4)
+		_, err := io.ReadFull(r, b)
+		if err != nil {
+			return "", err
+		}
+		return net.IP(b).String(), nil
+	case 0x03: // domain
+		n, err := r.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		b := make([]byte, n)
+		_, err = io.ReadFull(r, b)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	case 0x04: // IPv6
+		b := make([]byte, 16)
+		_, err := io.ReadFull(r, b)
+		if err != nil {
+			return "", err
+		}
+		return net.IP(b).String(), nil
+	}
+	return "", fmt.Errorf("unknown atyp %d", atyp)
+}
+
+func readPort(r *bufio.Reader) (int, error) {
+	b := make([]byte, 2)
+	_, err := io.ReadFull(r, b)
+	if err != nil {
+		return 0, err
+	}
+	return int(binary.BigEndian.Uint16(b)), nil
+}
+
+func setNoDelay(conns ...net.Conn) {
+	for _, c := range conns {
+		if t, ok := c.(*net.TCPConn); ok {
+			t.SetNoDelay(true)
+		}
 	}
 }
 

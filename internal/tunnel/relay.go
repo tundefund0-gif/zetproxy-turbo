@@ -60,7 +60,7 @@ func StartRelayTunnel(localPort, relayAddr string) error {
 	host := relayHost(relayAddr)
 	setTunnelURL(fmt.Sprintf("%s (relay %s)", host, id))
 	log.Printf("[Tunnel] Registered as %s on relay %s", id, relayAddr)
-	log.Printf("[Tunnel] Enter in Super Proxy: host=%s port=%s (SOCKS5)", host, localPort)
+	log.Printf("[Tunnel] Enter in Super Proxy: host=%s port=%s (SOCKS5)", host, relayAddr[strings.LastIndex(relayAddr, ":")+1:])
 
 	go func() {
 		for {
@@ -71,7 +71,12 @@ func StartRelayTunnel(localPort, relayAddr string) error {
 			}
 			line = strings.TrimSpace(line)
 
-			if line == "conn" {
+			if strings.HasPrefix(line, "conn:") {
+				parts := strings.SplitN(line[5:], ":", 2)
+				if len(parts) == 2 {
+					go handleRelayTarget(relayAddr, parts[0], parts[1])
+				}
+			} else if line == "conn" {
 				go handleRelayData(localPort, relayAddr, id, ctrl)
 			}
 		}
@@ -80,6 +85,43 @@ func StartRelayTunnel(localPort, relayAddr string) error {
 	<-tunnelStop
 	ctrl.Close()
 	return nil
+}
+
+func handleRelayTarget(relayAddr, cid, target string) {
+	log.Printf("[Tunnel] Relay target %s -> %s", cid, target)
+
+	data, err := net.DialTimeout("tcp", relayAddr, 10*time.Second)
+	if err != nil {
+		log.Printf("[Tunnel] Data conn failed: %v", err)
+		return
+	}
+	defer data.Close()
+
+	if _, err := fmt.Fprintf(data, "data:%s\n", cid); err != nil {
+		return
+	}
+
+	rr := bufio.NewReader(data)
+	resp, _ := rr.ReadString('\n')
+	if strings.TrimSpace(resp) != "ready" {
+		return
+	}
+
+	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		log.Printf("[Tunnel] Target %s unreachable: %v", target, err)
+		return
+	}
+	defer targetConn.Close()
+
+	if t, ok := data.(*net.TCPConn); ok {
+		t.SetNoDelay(true)
+	}
+	if t, ok := targetConn.(*net.TCPConn); ok {
+		t.SetNoDelay(true)
+	}
+
+	relayPool.Relay(targetConn, data)
 }
 
 func handleRelayData(localPort, relayAddr, id string, ctrl net.Conn) {
