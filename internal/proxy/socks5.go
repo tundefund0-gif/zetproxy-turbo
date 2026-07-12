@@ -20,17 +20,17 @@ type SOCKS5Stats struct {
 	BytesOut      int64   `json:"bytes_out"`
 	ConnsTotal    int64   `json:"conns_total"`
 	ConnsFailed   int64   `json:"conns_failed"`
-	ConnsActive   int32   `json:"conns_active"`
 	ConnsRejected int64   `json:"conns_rejected"`
 	StartTime     int64   `json:"start_time"`
 	ThroughputIn  float64 `json:"throughput_in_mbps"`
 	ThroughputOut float64 `json:"throughput_out_mbps"`
-	MemAlloc      uint32  `json:"mem_alloc_mb"`
-	MemSys        uint32  `json:"mem_sys_mb"`
-	NumGoroutine  int     `json:"num_goroutine"`
 	BytesInPrev   int64
 	BytesOutPrev  int64
 	LastCalcTime  time.Time
+	ConnsActive   int32 `json:"conns_active"`
+	MemAlloc      uint32 `json:"mem_alloc_mb"`
+	MemSys        uint32 `json:"mem_sys_mb"`
+	NumGoroutine  int    `json:"num_goroutine"`
 }
 
 type SOCKS5Server struct {

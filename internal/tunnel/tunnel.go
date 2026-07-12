@@ -20,7 +20,6 @@ type Stats struct {
 	BytesIn        int64   `json:"bytes_in"`
 	BytesOut       int64   `json:"bytes_out"`
 	ConnsTotal     int64   `json:"conns_total"`
-	ConnsActive    int32   `json:"conns_active"`
 	ConnsRejected  int64   `json:"conns_rejected"`
 	ConnsFailed    int64   `json:"conns_failed"`
 	StartTime      int64   `json:"start_time"`
@@ -28,12 +27,13 @@ type Stats struct {
 	ThroughputOut  float64 `json:"throughput_out_mbps"`
 	BytesInPrev    int64
 	BytesOutPrev   int64
+	TCPAccepts     int64  `json:"tcp_accepts"`
+	UDPPackets     int64  `json:"udp_packets"`
 	LastCalcTime   time.Time
+	ConnsActive    int32 `json:"conns_active"`
 	MemAlloc       uint32 `json:"mem_alloc_mb"`
 	MemSys         uint32 `json:"mem_sys_mb"`
 	NumGoroutine   int    `json:"num_goroutine"`
-	TCPAccepts     int64  `json:"tcp_accepts"`
-	UDPPackets     int64  `json:"udp_packets"`
 }
 
 type Server struct {
