@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"bufio"
 	"crypto/rand"
 	"fmt"
 	"io"
@@ -99,88 +98,70 @@ func startServeoTunnel(localPort, username string) (string, error) {
 		"-o", "ServerAliveCountMax=3",
 		"-o", "ConnectTimeout=10",
 		"-R", fmt.Sprintf("80:127.0.0.1:%s", localPort),
-		"-N",
 		fmt.Sprintf("%s@serveo.net", username),
+		"sleep", "3600",
 	)
 
-	// Combine stdout+stderr into one pipe
-	combined, err := cmd.StderrPipe()
-	if err != nil {
-		return "", fmt.Errorf("pipe: %w", err)
-	}
-	// Also capture stdout
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", fmt.Errorf("stdout pipe: %w", err)
-	}
+	// URL is on stderr (NOT stdout) when -N is NOT used
+	stderr, _ := cmd.StderrPipe()
+	stdout, _ := cmd.StdoutPipe()
 
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("start: %w", err)
 	}
 
-	type line struct {
-		text string
+	type chunk struct {
+		data string
 		err  error
 	}
-	lines := make(chan line, 64)
+	lines := make(chan chunk, 64)
 
 	reader := func(r io.Reader) {
-		br := bufio.NewReaderSize(r, 4096)
+		tmp := make([]byte, 4096)
 		for {
-			l, err := br.ReadString('\n')
+			n, err := r.Read(tmp)
 			if err != nil {
-				if err != io.EOF {
-					lines <- line{err: err}
-				}
 				return
 			}
-			lines <- line{text: l}
+			lines <- chunk{data: string(tmp[:n])}
 		}
 	}
 
-	go reader(combined)
+	go reader(stderr)
 	go reader(stdout)
 
+	buf := ""
 	for {
 		select {
 		case l := <-lines:
-			if l.err != nil {
-				continue
-			}
-			out := strings.TrimRight(l.text, "\r\n")
-			log.Printf("[Tunnel] serveo: %s", out)
+			buf += l.data
+			log.Printf("[Tunnel] serveo: %s", l.data)
 
-			if strings.Contains(out, "forwarding failed") {
+			if strings.Contains(buf, "forwarding failed") {
 				cmd.Process.Kill()
 				return "", fmt.Errorf("port rejected")
 			}
-			if strings.Contains(out, "https://") || strings.Contains(out, "http://") {
-				idx := strings.Index(out, "https://")
-				if idx < 0 {
-					idx = strings.Index(out, "http://")
-				}
-				rest := out[idx:]
-				end := strings.IndexAny(rest, " \t\r\n")
+			if idx := strings.Index(buf, "https://"); idx >= 0 {
+				rest := buf[idx:]
+				// Find end of URL (space, tab, newline, or ANSI escape)
+				end := strings.IndexAny(rest, " \t\r\n\033")
 				if end > 0 {
 					rest = rest[:end]
 				}
 				host := strings.TrimPrefix(rest, "https://")
-				host = strings.TrimPrefix(host, "http://")
 				tunnelCmd = cmd
 				go func() {
 					<-tunnelStop
 					cmd.Process.Kill()
 				}()
 				go func() {
-					if err := cmd.Wait(); err != nil {
-						log.Printf("[Tunnel] serveo exited: %v", err)
-					}
+					cmd.Wait()
 				}()
 				return host, nil
 			}
 		case <-time.After(20 * time.Second):
 			cmd.Process.Kill()
-			return "", fmt.Errorf("timeout waiting for serveo URL")
+			return "", fmt.Errorf("timeout waiting for serveo URL. Output: %s", buf)
 		}
 	}
 }
