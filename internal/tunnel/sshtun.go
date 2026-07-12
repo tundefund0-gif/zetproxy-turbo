@@ -1,13 +1,14 @@
 package tunnel
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"log"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 var (
@@ -45,125 +46,113 @@ func StartSSHTunnel(localPort, sshHost string) error {
 		sshHost = "serveo.net"
 	}
 
-	remotePort := localPort
+	customPort := ""
 	if strings.Contains(sshHost, ":") {
 		parts := strings.SplitN(sshHost, ":", 2)
 		sshHost = parts[0]
-		remotePort = parts[1]
+		customPort = parts[1]
 	}
 
-	knownHosts := "/dev/null"
-	if sshHost == "serveo.net" {
-		knownHosts = "/dev/null"
-	} else if strings.Contains(sshHost, "localhost.run") {
-		knownHosts = "/dev/null"
+	port, _ := strconv.Atoi(localPort)
+	if port == 0 {
+		port = 1088
 	}
 
-	args := []string{
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=" + knownHosts,
-		"-o", "ServerAliveInterval=30",
-		"-o", "ServerAliveCountMax=3",
-		"-o", "ExitOnForwardFailure=yes",
-		"-R", fmt.Sprintf("%s:127.0.0.1:%s", remotePort, localPort),
-		"-N",
+	portsToTry := []int{port}
+	if customPort != "" {
+		if cp, err := strconv.Atoi(customPort); err == nil {
+			portsToTry = []int{cp}
+		}
+	} else if sshHost == "serveo.net" {
+		portsToTry = []int{port, 8080, 8888, 9999, 10000, 10800}
 	}
 
 	userHost := sshHost
 	if !strings.Contains(sshHost, "@") && sshHost == "serveo.net" {
-		args = append(args, "serveo.net")
-	} else {
-		args = append(args, userHost)
+		userHost = "serveo.net"
 	}
 
-	log.Printf("[Tunnel] Starting SSH tunnel: %s -> %s:%s", sshHost, remotePort, localPort)
-	log.Printf("[Tunnel] ssh %s", strings.Join(args, " "))
+	for _, tryPort := range portsToTry {
+		log.Printf("[Tunnel] Trying SSH port forward %d -> localhost:%s ...", tryPort, localPort)
 
-	tunnelCmd = exec.Command("ssh", args...)
-
-	stdout, err := tunnelCmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderr, err := tunnelCmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("stderr pipe: %w", err)
-	}
-
-	if err := tunnelCmd.Start(); err != nil {
-		return fmt.Errorf("start ssh: %w", err)
-	}
-
-	go parseSSHOutput(stdout, "out", remotePort, sshHost)
-	go parseSSHOutput(stderr, "err", remotePort, sshHost)
-
-	go func() {
-		if err := tunnelCmd.Wait(); err != nil {
-			log.Printf("[Tunnel] SSH exited: %v", err)
+		err := trySSHRemote(userHost, localPort, tryPort)
+		if err == nil {
+		host := sshHost
+		if strings.Contains(host, ":") {
+			host = strings.SplitN(host, ":", 2)[0]
 		}
-	}()
-
-	go func() {
-		select {
-		case <-tunnelStop:
-			if tunnelCmd != nil && tunnelCmd.Process != nil {
-				tunnelCmd.Process.Kill()
-			}
+		setTunnelURL(fmt.Sprintf("%s:%d", host, tryPort))
+		log.Printf("[Tunnel] PUBLIC SOCKS5: %s:%d", host, tryPort)
+			log.Printf("[Tunnel] Set Super Proxy to SOCKS5 host=%s port=%d", sshHost, tryPort)
+			return nil
 		}
-	}()
+		log.Printf("[Tunnel] Port %d failed: %v", tryPort, err)
+	}
 
-	setTunnelURL(fmt.Sprintf("%s:%s", sshHost, remotePort))
-
-	return nil
+	return fmt.Errorf("all ports failed on %s", sshHost)
 }
 
-func parseSSHOutput(reader io.Reader, label, port, host string) {
-	scanner := bufio.NewScanner(reader)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.Contains(line, "Forwarding") || strings.Contains(line, "forwarding") {
-			log.Printf("[Tunnel] %s", line)
-		}
-		if strings.Contains(line, "http://") || strings.Contains(line, "https://") {
-			log.Printf("[Tunnel] PUBLIC URL: %s", line)
-			url := extractURL(line)
-			if url != "" {
-				setTunnelURL(url)
-			}
-		}
-		if strings.Contains(line, "port") && strings.Contains(line, "forward") {
-			log.Printf("[Tunnel] %s", line)
-		}
-		if strings.Contains(line, "connecting") || strings.Contains(line, "connected") {
-			log.Printf("[Tunnel] %s", line)
-		}
-		if label == "err" && !strings.Contains(line, "debug") && !strings.Contains(line, "Warning") {
-			if strings.Contains(line, "Authentication") || strings.Contains(line, "password") || strings.Contains(line, "denied") || strings.Contains(line, "refused") || strings.Contains(line, "error") {
-				log.Printf("[Tunnel] %s", line)
-			}
-		}
+func trySSHRemote(host, localPort string, remotePort int) error {
+	args := []string{
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
+		"-o", "ExitOnForwardFailure=yes",
+		"-o", "ConnectTimeout=10",
 	}
-}
 
-func extractURL(line string) string {
-	line = strings.TrimSpace(line)
-	idx := strings.Index(line, "http://")
-	if idx >= 0 {
-		end := strings.Index(line[idx:], " ")
-		if end > 0 {
-			return line[idx : idx+end]
-		}
-		return line[idx:]
+	wildcard := fmt.Sprintf("*:%d:127.0.0.1:%s", remotePort, localPort)
+	noWildcard := fmt.Sprintf("%d:127.0.0.1:%s", remotePort, localPort)
+
+	args = append(args, "-R", wildcard, "-R", noWildcard, "-N", host)
+
+	cmd := exec.Command("ssh", args...)
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
 	}
-	idx = strings.Index(line, "https://")
-	if idx >= 0 {
-		end := strings.Index(line[idx:], " ")
-		if end > 0 {
-			return line[idx : idx+end]
-		}
-		return line[idx:]
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start: %w", err)
 	}
-	return ""
+
+	errCh := make(chan error, 1)
+	var stderrBuf strings.Builder
+
+	go func() {
+		io.Copy(&stderrBuf, stderr)
+		errCh <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-errCh:
+		output := stderrBuf.String()
+		if err != nil {
+			if strings.Contains(output, "forwarding failed") {
+				return fmt.Errorf("port %d rejected", remotePort)
+			}
+			lines := strings.SplitN(output, "\n", 2)
+			return fmt.Errorf("%s", strings.TrimSpace(lines[0]))
+		}
+		return nil
+	case <-time.After(3 * time.Second):
+		if cmd.Process != nil {
+			tunnelCmd = cmd
+			go func() {
+				<-tunnelStop
+				cmd.Process.Kill()
+			}()
+			go func() {
+				if err := cmd.Wait(); err != nil {
+					log.Printf("[Tunnel] SSH exited: %v", err)
+				}
+			}()
+			return nil
+		}
+		return fmt.Errorf("process vanished")
+	}
 }
 
 func ParseTunnelConfig(val string) (mode string, remote string) {
@@ -177,10 +166,6 @@ func ParseTunnelConfig(val string) (mode string, remote string) {
 	if val == "localrun" {
 		return "ssh", "nokey@localhost.run"
 	}
-	if strings.HasPrefix(val, "ssh:") {
-		rest := val[4:]
-		return "ssh", rest
-	}
 	if strings.HasPrefix(val, "serveo:") {
 		rest := val[7:]
 		if rest == "" {
@@ -188,15 +173,15 @@ func ParseTunnelConfig(val string) (mode string, remote string) {
 		}
 		return "ssh", rest
 	}
-	if strings.Contains(val, "@") || strings.Contains(val, ".com") || strings.Contains(val, ".net") || strings.Contains(val, ".org") {
+	if strings.HasPrefix(val, "ssh:") {
+		rest := val[4:]
+		if !strings.Contains(rest, "@") && !strings.Contains(rest, ".") {
+			rest = rest + "@" + rest
+		}
+		return "ssh", rest
+	}
+	if strings.Contains(val, "@") || strings.Contains(val, ".") {
 		return "ssh", val
 	}
 	return "ssh", "serveo.net"
-}
-
-func init() {
-	_, err := exec.LookPath("ssh")
-	if err != nil {
-		log.Printf("[Tunnel] ssh not found in PATH. Install: pkg install openssh")
-	}
 }
