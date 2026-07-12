@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bufio"
 	"crypto/rand"
 	"fmt"
 	"io"
@@ -96,92 +97,91 @@ func startServeoTunnel(localPort, username string) (string, error) {
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
-		"-o", "ExitOnForwardFailure=yes",
 		"-o", "ConnectTimeout=10",
 		"-R", fmt.Sprintf("80:127.0.0.1:%s", localPort),
 		"-N",
 		fmt.Sprintf("%s@serveo.net", username),
 	)
 
+	// Combine stdout+stderr into one pipe
+	combined, err := cmd.StderrPipe()
+	if err != nil {
+		return "", fmt.Errorf("pipe: %w", err)
+	}
+	// Also capture stdout
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return "", fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return "", fmt.Errorf("stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("start: %w", err)
 	}
 
-	urlCh := make(chan string, 1)
-	errCh := make(chan error, 1)
+	type line struct {
+		text string
+		err  error
+	}
+	lines := make(chan line, 64)
 
-	go func() {
-		buf := make([]byte, 4096)
+	reader := func(r io.Reader) {
+		br := bufio.NewReaderSize(r, 4096)
 		for {
-			n, err := stdout.Read(buf)
+			l, err := br.ReadString('\n')
 			if err != nil {
+				if err != io.EOF {
+					lines <- line{err: err}
+				}
 				return
 			}
-			output := string(buf[:n])
-			log.Printf("[Tunnel] serveo: %s", output)
-			if idx := strings.Index(output, "https://"); idx >= 0 {
-				end := strings.Index(output[idx:], " ")
-				if end < 0 {
-					end = len(output[idx:])
-				}
-				url := strings.TrimSpace(output[idx : idx+end])
-				urlCh <- url
-			}
+			lines <- line{text: l}
 		}
-	}()
+	}
 
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := stderr.Read(buf)
-			if err != nil {
-				return
+	go reader(combined)
+	go reader(stdout)
+
+	for {
+		select {
+		case l := <-lines:
+			if l.err != nil {
+				continue
 			}
-			output := string(buf[:n])
-			log.Printf("[Tunnel] serveo: %s", output)
-			if strings.Contains(output, "forwarding failed") {
-				errCh <- fmt.Errorf("port rejected")
+			out := strings.TrimRight(l.text, "\r\n")
+			log.Printf("[Tunnel] serveo: %s", out)
+
+			if strings.Contains(out, "forwarding failed") {
+				cmd.Process.Kill()
+				return "", fmt.Errorf("port rejected")
 			}
-			if idx := strings.Index(output, "https://"); idx >= 0 {
-				end := strings.Index(output[idx:], " ")
-				if end < 0 {
-					end = len(output[idx:])
+			if strings.Contains(out, "https://") || strings.Contains(out, "http://") {
+				idx := strings.Index(out, "https://")
+				if idx < 0 {
+					idx = strings.Index(out, "http://")
 				}
-				url := strings.TrimSpace(output[idx : idx+end])
-				urlCh <- url
+				rest := out[idx:]
+				end := strings.IndexAny(rest, " \t\r\n")
+				if end > 0 {
+					rest = rest[:end]
+				}
+				host := strings.TrimPrefix(rest, "https://")
+				host = strings.TrimPrefix(host, "http://")
+				tunnelCmd = cmd
+				go func() {
+					<-tunnelStop
+					cmd.Process.Kill()
+				}()
+				go func() {
+					if err := cmd.Wait(); err != nil {
+						log.Printf("[Tunnel] serveo exited: %v", err)
+					}
+				}()
+				return host, nil
 			}
-		}
-	}()
-
-	select {
-	case url := <-urlCh:
-		tunnelCmd = cmd
-		go func() {
-			<-tunnelStop
+		case <-time.After(20 * time.Second):
 			cmd.Process.Kill()
-		}()
-		go func() {
-			if err := cmd.Wait(); err != nil {
-				log.Printf("[Tunnel] serveo exited: %v", err)
-			}
-		}()
-		host := strings.TrimPrefix(url, "https://")
-		return host, nil
-	case err := <-errCh:
-		cmd.Process.Kill()
-		return "", err
-	case <-time.After(15 * time.Second):
-		cmd.Process.Kill()
-		return "", fmt.Errorf("timeout waiting for serveo URL")
+			return "", fmt.Errorf("timeout waiting for serveo URL")
+		}
 	}
 }
 
@@ -253,7 +253,10 @@ func ParseTunnelConfig(val string) (mode string, remote string) {
 	if val == "" {
 		return "", ""
 	}
-	if val == "ssh" || val == "serveo" || val == "1" || val == "true" || val == "yes" {
+	if val == "serveo" {
+		return "serveo", "serveo.net"
+	}
+	if val == "ssh" || val == "1" || val == "true" || val == "yes" {
 		return "ssh", "serveo.net"
 	}
 	if val == "localrun" {
