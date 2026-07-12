@@ -1,11 +1,9 @@
 package tunnel
 
 import (
-	"crypto/rand"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"os/exec"
 	"strings"
 	"sync"
@@ -40,30 +38,8 @@ func StopTunnel() {
 	}
 }
 
-func randUser() string {
-	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, 12)
-	for i := range b {
-		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(chars))))
-		b[i] = chars[n.Int64()]
-	}
-	return string(b)
-}
-
 func StartSSHTunnel(localPort, sshHost string) error {
 	tunnelStop = make(chan struct{})
-
-	if sshHost == "" || sshHost == "serveo.net" {
-		user := randUser()
-		url, err := startServeoTunnel(localPort, user)
-		if err != nil {
-			return err
-		}
-		setTunnelURL(url)
-		log.Printf("[Tunnel] PUBLIC HTTP: %s", url)
-		log.Printf("[Tunnel] Set Super Proxy to HTTP proxy host=%s port=80", url)
-		return nil
-	}
 
 	remotePortStr := ""
 	if strings.Contains(sshHost, ":") {
@@ -88,82 +64,6 @@ func StartSSHTunnel(localPort, sshHost string) error {
 	}
 
 	return fmt.Errorf("all ports failed on %s", sshHost)
-}
-
-func startServeoTunnel(localPort, username string) (string, error) {
-	cmd := exec.Command("ssh",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ServerAliveInterval=15",
-		"-o", "ServerAliveCountMax=3",
-		"-o", "ConnectTimeout=10",
-		"-R", fmt.Sprintf("80:127.0.0.1:%s", localPort),
-		fmt.Sprintf("%s@serveo.net", username),
-		"sleep", "3600",
-	)
-
-	// URL is on stderr (NOT stdout) when -N is NOT used
-	stderr, _ := cmd.StderrPipe()
-	stdout, _ := cmd.StdoutPipe()
-
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("start: %w", err)
-	}
-
-	type chunk struct {
-		data string
-		err  error
-	}
-	lines := make(chan chunk, 64)
-
-	reader := func(r io.Reader) {
-		tmp := make([]byte, 4096)
-		for {
-			n, err := r.Read(tmp)
-			if err != nil {
-				return
-			}
-			lines <- chunk{data: string(tmp[:n])}
-		}
-	}
-
-	go reader(stderr)
-	go reader(stdout)
-
-	buf := ""
-	for {
-		select {
-		case l := <-lines:
-			buf += l.data
-			log.Printf("[Tunnel] serveo: %s", l.data)
-
-			if strings.Contains(buf, "forwarding failed") {
-				cmd.Process.Kill()
-				return "", fmt.Errorf("port rejected")
-			}
-			if idx := strings.Index(buf, "https://"); idx >= 0 {
-				rest := buf[idx:]
-				// Find end of URL (space, tab, newline, or ANSI escape)
-				end := strings.IndexAny(rest, " \t\r\n\033")
-				if end > 0 {
-					rest = rest[:end]
-				}
-				host := strings.TrimPrefix(rest, "https://")
-				tunnelCmd = cmd
-				go func() {
-					<-tunnelStop
-					cmd.Process.Kill()
-				}()
-				go func() {
-					cmd.Wait()
-				}()
-				return host, nil
-			}
-		case <-time.After(20 * time.Second):
-			cmd.Process.Kill()
-			return "", fmt.Errorf("timeout waiting for serveo URL. Output: %s", buf)
-		}
-	}
 }
 
 func trySSHRemote(host, localPort, remotePort string) error {
@@ -234,8 +134,8 @@ func ParseTunnelConfig(val string) (mode string, remote string) {
 	if val == "" {
 		return "", ""
 	}
-	if val == "serveo" {
-		return "serveo", "serveo.net"
+	if val == "serveo" || val == "serveo.net" {
+		return "serveo", ""
 	}
 	if val == "ssh" || val == "1" || val == "true" || val == "yes" {
 		return "ssh", "serveo.net"

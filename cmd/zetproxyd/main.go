@@ -84,14 +84,25 @@ func main() {
 					log.Printf("[Tunnel] Error: %v", err)
 				}
 			case "serveo":
-				tunPort := tcpAddr[1:]
-				if tunPort == "" {
-					tunPort = "8888"
-				}
-				log.Printf("[Tunnel] Starting serveo HTTP tunnel (port 80 -> TCP tunnel :%s) ...", tunPort)
-				if err := tunnel.StartSSHTunnel(tunPort, "serveo.net"); err != nil {
-					log.Printf("[Tunnel] Error: %v", err)
-				}
+				log.Println("")
+				log.Println("╔══════════════════════════════════════════════════╗")
+				log.Println("║  serveo.net is a REVERSE proxy (exposes local   ║")
+				log.Println("║  servers). It CANNOT be used as a forward proxy ║")
+				log.Println("║  (SOCKS5/HTTP CONNECT). Protocol errors occur.  ║")
+				log.Println("╠══════════════════════════════════════════════════╣")
+				log.Println("║  For SOCKS5 proxy over internet, use:           ║")
+				log.Println("║                                                ║")
+				log.Println("║  Option 1: Custom SSH server (most reliable)   ║")
+				log.Println("║    ZETPROXY_TUNNEL=ssh:user@your-vps.com       ║")
+				log.Println("║                                                ║")
+				log.Println("║  Option 2: Relay on Railway (free SOCKS5)      ║")
+				log.Println("║    ZETPROXY_TUNNEL=relay:host:7800             ║")
+				log.Println("║                                                ║")
+				log.Println("║  Deploy relay: github.com/tundefund0-gif/      ║")
+				log.Println("║    zetproxy-turbo → Deploy on Railway          ║")
+				log.Println("╚══════════════════════════════════════════════════╝")
+				log.Println("")
+				log.Println("[Tunnel] serveo.net is not supported as a proxy tunnel. Use relay or SSH mode.")
 			default:
 				log.Printf("[Tunnel] Starting SSH tunnel to %s ...", remote)
 				if err := tunnel.StartSSHTunnel(socksPort, remote); err != nil {
@@ -127,8 +138,13 @@ func main() {
 	if tunnelMode != "" {
 		mode, remote := tunnel.ParseTunnelConfig(tunnelMode)
 		log.Println("───────────────────────────────────────────")
-		log.Printf("  Tunnel: %s -> %s (connecting...)", mode, remote)
-		log.Println("  Watch logs for the public URL!")
+		if mode == "serveo" {
+			log.Printf("  Tunnel mode: serveo.net (NOT SUPPORTED)")
+		} else if mode == "relay" {
+			log.Printf("  Tunnel: relay -> %s", remote)
+		} else {
+			log.Printf("  Tunnel: SSH -> %s", remote)
+		}
 	}
 	log.Println("═══════════════════════════════════════════")
 
