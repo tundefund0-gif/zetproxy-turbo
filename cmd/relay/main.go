@@ -33,9 +33,9 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "7800"
+		port = "8080"
 	}
-
+	log.Printf("PORT=%s", port)
 	l, err := net.Listen("tcp", ":"+port)
 	if err != nil {
 		log.Fatalf("Listen :%s: %v", port, err)
@@ -51,8 +51,18 @@ func main() {
 		if err != nil {
 			continue
 		}
-		go handle(conn)
+		go safeHandle(conn)
 	}
+}
+
+func safeHandle(conn net.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Panic: %v", r)
+		}
+		conn.Close()
+	}()
+	handle(conn)
 }
 
 func handle(conn net.Conn) {
@@ -61,7 +71,6 @@ func handle(conn net.Conn) {
 
 	line, err := r.ReadString('\n')
 	if err != nil {
-		conn.Close()
 		return
 	}
 	line = strings.TrimRight(line, "\r\n")
@@ -78,8 +87,9 @@ func handle(conn net.Conn) {
 		fmt.Fprintf(conn, "id:%s\n", id)
 		log.Printf("[%s] Register", id)
 
+		b := make([]byte, 1)
 		for {
-			_, err := r.ReadString('\n')
+			_, err := conn.Read(b)
 			if err != nil {
 				break
 			}
@@ -87,12 +97,10 @@ func handle(conn net.Conn) {
 		ctrlMu.Lock()
 		delete(ctrl, id)
 		ctrlMu.Unlock()
-		conn.Close()
 
 	case strings.HasPrefix(line, "connect:"):
 		id := line[8:]
 		if id == "" {
-			conn.Close()
 			return
 		}
 		fmt.Fprintf(conn, "ready\n")
@@ -121,7 +129,6 @@ func handle(conn net.Conn) {
 			pipe(conn, r, data, bufio.NewReaderSize(data, 65536))
 		case <-time.After(60 * time.Second):
 		}
-		conn.Close()
 
 	case strings.HasPrefix(line, "data:"):
 		id := line[5:]
@@ -137,17 +144,13 @@ func handle(conn net.Conn) {
 
 		if ok {
 			entry.dataCh <- conn
-		} else {
-			conn.Close()
 		}
 
 	case line == "ping":
 		fmt.Fprintf(conn, "pong\n")
-		conn.Close()
 
 	default:
 		fmt.Fprintf(conn, "relay\n")
-		conn.Close()
 	}
 }
 
@@ -159,22 +162,22 @@ func pipe(a net.Conn, ar *bufio.Reader, b net.Conn, br *bufio.Reader) {
 		if ar != nil {
 			io.Copy(b, ar)
 		}
-		if t, ok := b.(*net.TCPConn); ok {
-			t.CloseWrite()
-		} else {
-			b.Close()
-		}
+		halfClose(b)
 	}()
 	go func() {
 		defer wg.Done()
 		if br != nil {
 			io.Copy(a, br)
 		}
-		if t, ok := a.(*net.TCPConn); ok {
-			t.CloseWrite()
-		} else {
-			a.Close()
-		}
+		halfClose(a)
 	}()
 	wg.Wait()
+}
+
+func halfClose(c net.Conn) {
+	if t, ok := c.(*net.TCPConn); ok {
+		t.CloseWrite()
+	} else {
+		c.Close()
+	}
 }
