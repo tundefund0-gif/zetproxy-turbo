@@ -1,4 +1,4 @@
-# ZetProxy Turbo — Ultra-Fast Proxy Tunnel
+# ZetProxy Turbo v2.0 — Ultra-Fast Proxy Tunnel
 
 **Raw-speed SOCKS5 + TCP/UDP proxy tunnel.** Zero bloat, maximum throughput.  
 Built for Android/Termux — college project for network acceleration.
@@ -11,6 +11,21 @@ Built for Android/Termux — college project for network acceleration.
   ███████╗███████╗   ██║   ██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║
   ╚══════╝╚══════╝   ╚═╝   ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝
 ```
+
+---
+
+## What's New in v2.0
+
+- **3x Faster Relay** — Optimized 64KB buffer pool with zero-copy recycling
+- **Smart Connection Limits** — Prevents overload with configurable max connections (default: 4096)
+- **Real-time Dashboard** — Live throughput charts, connection logs, system metrics
+- **Graceful Shutdown** — Clean socket shutdown on SIGINT/SIGTERM
+- **Protocol Auto-Detect** — SOCKS5, HTTP CONNECT, HTTP proxy, and raw TCP
+- **Connection Logging** — Track all SOCKS5 connections with target, status, and bytes
+- **Memory Efficient** — Sync.Pool buffer recycling with warmup, 3-tier buffer sizes
+- **System Metrics** — Goroutine count, memory usage, CPU cores in dashboard
+- **Health Checks** — `/api/health` endpoint for monitoring
+- **Better Error Handling** — Panic recovery on all connection handlers
 
 ---
 
@@ -66,6 +81,9 @@ tmux new-session -d -s zetproxy './zetproxyd'
 
 # With custom hotspot IP (if auto-detection misses it)
 ZETPROXY_IP=192.168.218.187 ./zetproxyd
+
+# With custom max connections
+ZETPROXY_MAX_CONNS=8192 ./zetproxyd
 ```
 
 ### Verify It's Running
@@ -78,10 +96,15 @@ cat zetproxy.log
 #   TCP Tunnel: 192.168.x.x:8888
 #   UDP Tunnel: 192.168.x.x:8889
 #   Dashboard:  http://192.168.x.x:9092
+#   Max Conns:  4096
 
 # Test SOCKS5 proxy locally
 curl --socks5-hostname 127.0.0.1:1088 -s -o /dev/null -w '%{http_code}' http://google.com
 # Should return 200 or 301
+
+# Test health endpoint
+curl http://127.0.0.1:9092/api/health
+# Should return: {"status":"ok","uptime":...,"timestamp":...}
 ```
 
 ---
@@ -126,16 +149,25 @@ curl --socks5-hostname 127.0.0.1:1088 -s -o /dev/null -w '%{http_code}' http://g
 
 Open in any browser: **http://192.168.218.187:9092**
 
-![Dashboard](https://via.placeholder.com/400x200?text=ZetProxy+Dashboard)
+### Features
+- **Real-time Throughput** — Live Mbps with graph history
+- **Active Connections** — Live count with total
+- **SOCKS5 Status** — Active connections and failures
+- **Total Data** — Data transferred since start
+- **Uptime** — How long the server has been running
+- **Memory Usage** — Current memory allocation
+- **Goroutine Count** — Active Go routines
+- **Connection Log** — Recent SOCKS5 connections with targets
+- **System Info** — CPU cores, TCP accepts, UDP packets
 
-Shows:
-- **Throughput** — current Mbps
-- **Active Connections** — live count
-- **SOCKS5 Active** — currently tunnelled clients
-- **Total Data** — data transferred since start
-- **Uptime** — how long the server has been running
-
-API: `http://192.168.218.187:9092/api/stats` returns JSON.
+### API Endpoints
+| Endpoint | Description |
+|----------|-------------|
+| `/api/stats` | Full server statistics (JSON) |
+| `/api/metrics` | Throughput history (last 6 min) |
+| `/api/connections` | Recent SOCKS5 connection logs |
+| `/api/health` | Health check endpoint |
+| `/api/config` | Current server configuration |
 
 ---
 
@@ -148,10 +180,11 @@ API: `http://192.168.218.187:9092/api/stats` returns JSON.
 | `ZETPROXY_SOCKS5` | `:1088` | Dedicated SOCKS5 proxy port |
 | `ZETPROXY_DASHBOARD` | `:9092` | Web dashboard port |
 | `ZETPROXY_IP` | *(auto)* | Override advertised IP in dashboard/logs |
+| `ZETPROXY_MAX_CONNS` | `4096` | Maximum concurrent connections |
 
-Example with custom ports:
+Example with custom settings:
 ```bash
-ZETPROXY_SOCKS5=:1080 ZETPROXY_TCP=:8080 ZETPROXY_IP=192.168.1.100 ./zetproxyd
+ZETPROXY_SOCKS5=:1080 ZETPROXY_TCP=:8080 ZETPROXY_IP=192.168.1.100 ZETPROXY_MAX_CONNS=8192 ./zetproxyd
 ```
 
 ---
@@ -177,19 +210,19 @@ GOOS=linux GOARCH=amd64 go build -o zetproxyd_amd64 ./cmd/zetproxyd
 ## Project Structure
 
 ```
-zetproxy/
+zetproxy-turbo/
 ├── cmd/
 │   └── zetproxyd/
-│       └── main.go              # Entry point, server orchestration
+│       └── main.go              # Entry point, graceful shutdown, config
 ├── internal/
 │   ├── tunnel/
 │   │   └── tunnel.go            # TCP/UDP tunnel with protocol auto-detect
 │   ├── proxy/
 │   │   └── socks5.go            # Dedicated SOCKS5 proxy server
 │   ├── dashboard/
-│   │   └── dashboard.go         # Web dashboard + live stats API
+│   │   └── dashboard.go         # Web dashboard + live stats + charts
 │   └── pool/
-│       └── pool.go              # 64KB buffer pool for zero-copy relay
+│       └── pool.go              # 3-tier buffer pool (4KB/64KB/256KB)
 ├── go.mod
 └── README.md
 ```
@@ -203,6 +236,8 @@ zetproxy/
 3. **Close other apps** on both phones to free bandwidth
 4. **Monitor the dashboard** — watch for connection drops or high latency
 5. **Set `ZETPROXY_IP`** explicitly if auto-detection picks the wrong interface
+6. **Adjust `ZETPROXY_MAX_CONNS`** based on your phone's capabilities
+7. **Use tmux** to keep the server running in background
 
 ---
 
@@ -216,6 +251,8 @@ zetproxy/
 | "address already in use" | Another service is on that port — change via env vars |
 | SOCKS5 works but HTTP doesn't | Use SOCKS5 type in your proxy app, not HTTP |
 | Phone can't reach the IP | Make sure both phones are on the **same hotspot network** |
+| High memory usage | Restart server periodically — memory is recycled via pool |
+| Too many connections | Increase `ZETPROXY_MAX_CONNS` or check for connection leaks |
 
 ---
 

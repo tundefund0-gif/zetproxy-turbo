@@ -1,4 +1,3 @@
 zetproxyd
-zetproxyd_arm
-zetproxy.log
+zetproxyd_*
 *.log
